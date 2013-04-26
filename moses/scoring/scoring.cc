@@ -34,6 +34,7 @@
 #include <boost/range/algorithm_ext/for_each.hpp>
 #include <boost/range/adaptor/map.hpp>
 #include <boost/range/adaptor/filtered.hpp>
+#include <boost/range/adaptor/reversed.hpp>
 #include <boost/range/adaptor/transformed.hpp>
 
 #include <boost/spirit/include/phoenix_core.hpp>
@@ -42,6 +43,7 @@
 #include <opencog/util/numeric.h>
 #include <opencog/util/KLD.h>
 #include <opencog/util/MannWhitneyU.h>
+#include <opencog/comboreduct/table/table_io.h>
 
 namespace opencog { namespace moses {
 
@@ -49,6 +51,7 @@ using namespace std;
 using boost::adaptors::map_values;
 using boost::adaptors::map_keys;
 using boost::adaptors::filtered;
+using boost::adaptors::reversed;
 using boost::adaptors::transformed;
 using boost::transform;
 using namespace boost::phoenix;
@@ -57,7 +60,7 @@ using namespace boost::accumulators;
 
 // helper to log a combo_tree and its behavioral score
 inline void log_candidate_pbscore(const combo_tree& tr,
-                                  const penalized_behavioral_score& pbs)
+                                  const penalized_bscore& pbs)
 {
     if (!logger().isFineEnabled())
         return;
@@ -94,10 +97,10 @@ void bscore_base::set_complexity_coef(score_t complexity_ratio)
 // logical_bscore //
 ////////////////////
         
-penalized_behavioral_score logical_bscore::operator()(const combo_tree& tr) const
+penalized_bscore logical_bscore::operator()(const combo_tree& tr) const
 {
     combo::complete_truth_table tt(tr, arity);
-    penalized_behavioral_score pbs(
+    penalized_bscore pbs(
         make_pair<behavioral_score, score_t>(behavioral_score(target.size()), 0));
 
     boost::transform(tt, target, pbs.first.begin(), [](bool b1, bool b2) {
@@ -129,19 +132,21 @@ score_t contin_complexity_coef(unsigned alphabet_size, double stdev)
     return log(alphabet_size) * 2 * sq(stdev);
 }
 
-penalized_behavioral_score contin_bscore::operator()(const combo_tree& tr) const
+penalized_bscore contin_bscore::operator()(const combo_tree& tr) const
 {
     // OTable target is the table of output we want to get.
-    penalized_behavioral_score pbs;
+    penalized_bscore pbs;
 
     // boost/range/algorithm/transform.
     // Take the input vectors cit, target, feed the elts to anon
     // funtion[] (which just computes square of the difference) and
     // put the results into bs.
+    interpreter_visitor iv(tr);
+    auto interpret_tr = boost::apply_visitor(iv);
     boost::transform(cti, target, back_inserter(pbs.first),
-                     [&](const vertex_seq& vs, const vertex& v) {
+                     [&](const multi_type_seq& mts, const vertex& v) {
                          contin_t tar = get_contin(v),
-                             res = get_contin(eval_binding(vs, tr));
+                             res = get_contin(interpret_tr(mts.get_variant()));
                          return -err_func(res, tar);
                      });
     // add the Occam's razor feature
@@ -195,18 +200,32 @@ discriminator::discriminator(const CTable& ct)
     _output_type = ct.get_output_type();
     if (_output_type == id::boolean_type) {
         // For boolean tables, sum the total number of 'T' values
-        // in the output. 
-        sum_outputs = [](const CTable::counter_t& c)->score_t
+        // in the output.
+        sum_true = [](const CTable::counter_t& c)->score_t
         {
             return c.get(id::logical_true);
         };
+        // For boolean tables, sum the total number of 'F' values
+        // in the output.
+        sum_false = [](const CTable::counter_t& c)->score_t
+        {
+            return c.get(id::logical_false);
+        };
     } else if (_output_type == id::contin_type) {
-        // For contin tables, we return the sum of the row values.
-        sum_outputs = [](const CTable::counter_t& c)->score_t
+        // For contin tables, we return the sum of the row values > 0
+        sum_true = [](const CTable::counter_t& c)->score_t
         {
             score_t res = 0.0;
             for (const CTable::counter_t::value_type& cv : c)
-                res += get_contin(cv.first) * cv.second;
+                res += std::max(0.0, get_contin(cv.first) * cv.second);
+            return res;
+        };
+        // For contin tables, we return the sum of the row values < 0
+        sum_false = [](const CTable::counter_t& c)->score_t
+        {
+            score_t res = 0.0;
+            for (const CTable::counter_t::value_type& cv : c)
+                res += std::min(0.0, get_contin(cv.first) * cv.second);
             return res;
         };
     } else {
@@ -214,25 +233,16 @@ discriminator::discriminator(const CTable& ct)
         return;
     }
 
-    _positive_total = 0.0;
-    _negative_total = 0.0;
+    _true_total = 0.0;
+    _false_total = 0.0;
     for (const CTable::value_type& vct : _ctable) {
         // vct.first = input vector
         // vct.second = counter of outputs
-
-        contin_t sum_pos = sum_outputs(vct.second);
-        contin_t sum_neg;
-        unsigned totalc = vct.second.total_count();
-        if (_output_type == id::boolean_type) {
-            sum_neg = totalc - sum_pos;
-        } else {
-            sum_neg = -sum_pos;
-        }
-        _positive_total += sum_pos;
-        _negative_total += sum_neg;
+        _true_total += sum_true(vct.second);
+        _false_total += sum_false(vct.second);
     }
-    logger().info() << "Discriminator: num_positive=" << _positive_total
-                    << " num_negative=" << _negative_total;
+    logger().info() << "Discriminator: num_true=" << _true_total
+                    << " num_false=" << _false_total;
 }
 
 
@@ -250,48 +260,80 @@ discriminator::d_counts discriminator::count(const combo_tree& tr) const
 {
     d_counts ctr;
 
+    interpreter_visitor iv(tr);
+    auto interpret_tr = boost::apply_visitor(iv);
+
     for (const CTable::value_type& vct : _ctable) {
         // vct.first = input vector
         // vct.second = counter of outputs
 
-        contin_t sum_pos = sum_outputs(vct.second);
-        contin_t sum_neg;
+        double pos = sum_true(vct.second);
+        double neg = sum_false(vct.second);
         unsigned totalc = vct.second.total_count();
-        if (_output_type == id::boolean_type) {
-            sum_neg = totalc - sum_pos;
-        } else {
-            sum_neg = -sum_pos;
-        }
 
-        if (eval_binding(vct.first, tr) == id::logical_true)
+        if (interpret_tr(vct.first.get_variant()) == id::logical_true)
         {
-            ctr.true_positive_sum += sum_pos;
-            ctr.false_positive_sum += sum_neg;
+            ctr.true_positive_sum += pos;
+            ctr.false_positive_sum += neg;
             ctr.positive_count += totalc;
         }
         else
         {
-            ctr.true_negative_sum += sum_neg;
-            ctr.false_negative_sum += sum_pos;
+            ctr.true_negative_sum += neg;
+            ctr.false_negative_sum += pos;
             ctr.negative_count += totalc;
         }
     }
     return ctr;
 }
 
+vector<discriminator::d_counts> discriminator::counts(const combo_tree& tr) const
+{
+    std::vector<d_counts> ctr_seq;
+
+    interpreter_visitor iv(tr);
+    auto interpret_tr = boost::apply_visitor(iv);
+
+    for (const CTable::value_type& vct : _ctable) {
+        // vct.first = input vector
+        // vct.second = counter of outputs
+
+        double pos = sum_true(vct.second);
+        double neg = sum_false(vct.second);
+        unsigned totalc = vct.second.total_count();
+
+        d_counts ctr;
+        if (interpret_tr(vct.first.get_variant()) == id::logical_true)
+        {
+            ctr.true_positive_sum = pos;
+            ctr.false_positive_sum = neg;
+            ctr.positive_count = totalc;
+        }
+        else
+        {
+            ctr.true_negative_sum = neg;
+            ctr.false_negative_sum = pos;
+            ctr.negative_count = totalc;
+        }
+        ctr_seq.push_back(ctr);
+    }
+    return ctr_seq;
+}
+
 //////////////////////////
 // disciminating_bscore //
-/////////////////////////
+//////////////////////////
 
 discriminating_bscore::discriminating_bscore(const CTable& ct,
-                  float min_threshold,
-                  float max_threshold,
-                  float hardness) 
+                                             float min_threshold,
+                                             float max_threshold,
+                                             float hardness)
     : discriminator(ct),
-    _ctable_usize(ct.uncompressed_size()),
-    _min_threshold(min_threshold),
-    _max_threshold(max_threshold),
-    _hardness(hardness)
+      _ctable_usize(ct.uncompressed_size()),
+      _min_threshold(min_threshold),
+      _max_threshold(max_threshold),
+      _hardness(hardness),
+      _full_bscore(true)
 {
     logger().info("Discriminating scorer, hardness = %f, "
                   "min_threshold = %f, "
@@ -338,52 +380,85 @@ discriminating_bscore::discriminating_bscore(const CTable& ct,
 /// wasn't actually reached.
 behavioral_score discriminating_bscore::best_possible_bscore() const
 {
-    // create a list, maintained in sorted order.
-    typedef std::multimap<contin_t, std::pair<contin_t, // variable
-                                              contin_t> // fixed
-                          > max_vary_t;
+    // create a list, maintained in sorted order by the best row
+    // (meaning the row that contributes the most to the overall
+    // score). We keep sum positive/negative of that row to not have
+    // to recompute it again.
+    typedef std::tuple<double, // row's sum positive
+                       double, // row's sum negative
+                       unsigned> // row's count
+        pos_neg_cnt;
+
+    typedef std::multimap<double, pos_neg_cnt> max_vary_t;
+
     max_vary_t max_vary;
     for (CTable::const_iterator it = _ctable.begin(); it != _ctable.end(); ++it)
     {
         const CTable::counter_t& c = it->second;
 
+        double pos = sum_true(c);
+        double neg = sum_false(c);
         unsigned total = c.total_count();
-        contin_t sum_pos = sum_outputs(c);
-        contin_t sum_neg;
-        if (_output_type == id::boolean_type) {
-            sum_neg = total - sum_pos;
-        } else {
-            sum_neg = -sum_pos;
-        }
 
-        contin_t vary = get_variable(sum_pos, sum_neg, total);
-        contin_t fix = get_fixed(sum_pos, sum_neg, total);
-        auto lmnt = std::make_pair(vary, std::make_pair(vary, fix));
-        max_vary.insert(lmnt);
+        double vary = get_variable(pos, neg, total);
+
+        logger().fine() << "Disc: total=" << total << " pos=" << pos
+                        << " neg=" << neg << " vary=" << vary;
+
+        const pos_neg_cnt pnc(pos, neg, total);
+        max_vary.insert({vary, pnc});
     }
 
-    // Sum up the best score, until the maximum fixed threshold is
-    // reached.  It's not clear this actually gives the best score one
-    // can get if min_threshold isn't reached, but we don't want to go
-    // below min_threshold anyway, so it's an acceptable inacurracy.
-    // (It would be a problem only if the threshold constraint is very loose.)
+    // Compute best variable part of the score till minimum fixed part
+    // is reached. It is assumed that once the fixed part is reached
+    // the variable part will only get lower so we can stop doing the
+    // calculation.
     //
-    score_t fix_sum = 0;
-    score_t best_score = 0.0;
-    reverse_foreach (const auto& mpv, max_vary) {
-        best_score += mpv.second.first;
-        fix_sum += mpv.second.second;
-        if (_max_threshold <= fix_sum)
+    // Then we select the best score obtained (accounting for both
+    // variable and fixed parts).
+    unsigned acc_cnt = 0;
+    score_t acc_pos = 0.0,     // accumulation of positive
+        acc_neg = 0.0,      // accumulation of negative
+        best_sc = 0.0,      // best score
+        best_vary = 0.0,    // best score varying component
+        best_fixed = 0.0,   // the best score fixed component
+        best_fixation_penalty = 0.0; // best score fixed component penalty
+
+    logger().fine() << "Disc: min_thresh=" << _min_threshold;
+
+    foreach (const pos_neg_cnt& pnc, max_vary | map_values | reversed) {
+        acc_pos += std::get<0>(pnc);
+        acc_neg += std::get<1>(pnc);
+        acc_cnt += std::get<2>(pnc);
+
+        // compute current score (and its varying and fixed parts)
+        score_t vary = get_variable(acc_pos, acc_neg, acc_cnt),
+            fixed = get_fixed(acc_pos, acc_neg, acc_cnt),
+            fixation_penalty = get_threshold_penalty(fixed),
+            sc = vary + fixation_penalty;
+
+        // update best score (and its varying and fixed parts)
+        if (sc > best_sc) {
+            best_sc = sc;
+            best_vary = vary;
+            best_fixed = fixed;
+            best_fixation_penalty = fixation_penalty;
+        }
+
+        logger().fine() << "Disc: vary=" << vary << " fixed=" << fixed
+                        << " score=" << sc;
+
+        // halt if fixed has reached _min_threshold
+        if (_min_threshold <= fixed)
             break;
     }
 
-    score_t fixation_penalty = get_threshold_penalty(fix_sum);
+    logger().info("Discriminating scorer, best score = %f", best_sc);
+    logger().info("Discriminating scorer, variable component of best score = %f", best_vary);
+    logger().info("Discriminating scorer, fixed component of best score = %f", best_fixed);
+    logger().info("Discriminating scorer, fixation penalty of best score = %f", best_fixation_penalty);
 
-    logger().info("Discriminating scorer, score at threshold = %f", best_score);
-    logger().info("Discriminating scorer, fixed component at threshold = %f", fix_sum);
-    logger().info("Discriminating scorer, fixation penalty at threshold = %f", fixation_penalty);
-
-    return {best_score, fixation_penalty};
+    return {best_vary, best_fixation_penalty};
 }
 
 score_t discriminating_bscore::min_improv() const
@@ -420,7 +495,7 @@ void discriminating_bscore::set_complexity_coef(unsigned alphabet_size, float p)
                                 // because the precision is normalized
                                 // as well
 
-    logger().info() << "Discriminiating scorer, noise = " << p
+    logger().info() << "Discriminating scorer, noise = " << p
                     << " alphabest size = " << alphabet_size
                     << " complexity ratio = " << 1.0/complexity_coef;
 }
@@ -441,6 +516,7 @@ void discriminating_bscore::set_complexity_coef(score_t ratio)
     if (occam)
         complexity_coef = 1.0 / (_ctable_usize * ratio);
 
+    logger().info() << "Discriminating scorer, table size = " << _ctable_usize;
     logger().info() << "Discriminating scorer, complexity ratio = " << 1.0f/complexity_coef;
 }
 
@@ -457,22 +533,25 @@ recall_bscore::recall_bscore(const CTable& ct,
 {
 }
 
-penalized_behavioral_score recall_bscore::operator()(const combo_tree& tr) const
+penalized_bscore recall_bscore::operator()(const combo_tree& tr) const
 {
     d_counts ctr = count(tr);
 
     // Compute normalized precision and recall.
-    score_t precision = ctr.true_positive_sum / (ctr.true_positive_sum + ctr.false_positive_sum);
-    score_t recall = ctr.true_positive_sum / (ctr.true_positive_sum + ctr.false_negative_sum);
+    score_t tp_fp = ctr.true_positive_sum + ctr.false_positive_sum;
+    score_t precision = (0.0 < tp_fp) ? ctr.true_positive_sum / tp_fp : 0.0;
+
+    score_t tp_fn = ctr.true_positive_sum + ctr.false_negative_sum;
+    score_t recall = (0.0 < tp_fn) ? ctr.true_positive_sum / tp_fn : 0.0;
 
     // We are maximizing recall, so that is the first part of the score.
-    penalized_behavioral_score pbs;
+    penalized_bscore pbs;
     pbs.first.push_back(recall);
     
     score_t precision_penalty = get_threshold_penalty(precision);
     pbs.first.push_back(precision_penalty);
     if (logger().isFineEnabled()) 
-        logger().fine("precision = %f  recall=%f  precision penalty=%e",
+        logger().fine("recall_bcore: precision = %f  recall=%f  precision penalty=%e",
                      precision, recall, precision_penalty);
  
     // Add the Complexity penalty
@@ -484,27 +563,34 @@ penalized_behavioral_score recall_bscore::operator()(const combo_tree& tr) const
     return pbs;
 }
 
-/// Return the best possible precision for this ctable row.
-/// (This does not necessarily correspnd to the most accurate model
-/// for this row, since, if the row has one postive and N negative
-/// values (for N>0), then the most precise model returns True to get
-/// a precision of 1/(N+1), whereas the most accurate model returns
-/// False to get a precision of zero.)
+/// Return the precision for this ctable row(s).
 ///
-/// FWIW, true_positives == pos  true_pos+false_pos = cnt
+/// Since this scorer is trying to maximize recall while holding
+/// precision fixed, We should return positive values as long as
+/// this table has some positive entries in it. (Why? Because the
+/// estimator sorts the table by the value returned here: so 
+/// entries with a perfect score should return 1, thos with no 
+/// positive entries should return 0, and everything else in the
+/// middle.
+///
+/// For this ctable row collection, we have that:
+/// pos == true_positives or false_negatives in this ctable row(s)
+/// neg == false_positives or true_negatives in this ctable row(s)
+/// cnt == pos + neg
+/// How the "best possible model" will score this row depends
+/// on what the precision threshold is.
 score_t recall_bscore::get_fixed(score_t pos, score_t neg, unsigned cnt) const
 {
-    contin_t best_possible_precision = pos / (cnt * _positive_total);
-    return best_possible_precision;
+    return pos / cnt;
 }
 
-/// Return the recall for this ctable row.
-/// This does not necessarily correspnd to the most accurate model for
-/// this row; see remarks above.
+/// Return the recall for this ctable row(s).
+///
+/// _true_total is the total number of rows that are T (or positive
+/// weighted if contin)
 score_t recall_bscore::get_variable(score_t pos, score_t neg, unsigned cnt) const
 {
-    contin_t best_possible_recall = 1.0 / _positive_total;
-    return best_possible_recall;
+    return pos / _true_total;
 }
 
 ///////////////////
@@ -521,23 +607,71 @@ prerec_bscore::prerec_bscore(const CTable& ct,
 
 // Nearly identical to recall_bscore, except that the roles of precision
 // and recall are switched.
-penalized_behavioral_score prerec_bscore::operator()(const combo_tree& tr) const
+penalized_bscore prerec_bscore::operator()(const combo_tree& tr) const
 {
-    d_counts ctr = count(tr);
+    penalized_bscore pbs;
+    score_t precision = 1.0,
+        recall = 0.0;
+    if (_full_bscore) {
+        // each element of the bscore correspond to a data point
+        // contribution of the variable component of the score
 
-    // Compute normalized precision and recall.
-    score_t precision = ctr.true_positive_sum / (ctr.true_positive_sum + ctr.false_positive_sum);
-    score_t recall = ctr.true_positive_sum / (ctr.true_positive_sum + ctr.false_negative_sum);
+        vector<d_counts> ctr_seq = counts(tr);
+        score_t pos_total = 0.0;
+        for (const d_counts& ctr : ctr_seq) {
+            // here we actually store (tp-fp)/2 instead of tp, to have
+            // a more expressive bscore (so that bad datapoints are
+            // distict from non-positive ones)
+            pbs.first.push_back((ctr.true_positive_sum - ctr.false_positive_sum)
+                                / 2);
+            pos_total += ctr.positive_count;
+        }
+        // divide all element by pos_total (so it sums up to precision - 1/2)
+        boost::transform(pbs.first, pbs.first.begin(), arg1 / pos_total);
 
-    // We are maximizing recall, so that is the first part of the score.
-    penalized_behavioral_score pbs;
-    pbs.first.push_back(precision);
-    
+        // By using (tp-fp)/2 the sum of all the per-row contributions
+        // is offset by -1/2 from the precision, as proved below
+        //
+        // 1/2 * (tp - fp) / (tp + fp)
+        // = 1/2 * (tp - tp + tp - fp) / (tp + fp)
+        // = 1/2 * (tp + tp) / (tp + fp) - (tp + fp) / (tp + fp)
+        // = 1/2 * 2*tp / (tp + fp) - 1
+        // = precision - 1/2
+        //
+        // So before adding the recall penalty we add +1/2 to
+        // compensate that
+        pbs.first.push_back(0.5);
+
+        // compute precision and recall
+        precision = boost::accumulate(pbs.first, 0);
+        for (const d_counts& ctr : ctr_seq)
+            recall += ctr.true_positive_sum;
+        if (0.0 < _true_total)
+            recall /= _true_total;
+    } else {
+        // the aggregated (across all datapoints) variable component
+        // of the score is the first value of the bscore
+
+        d_counts ctr = count(tr);
+
+        // Compute normalized precision and recall.
+        score_t tp_fp = ctr.true_positive_sum + ctr.false_positive_sum;
+        precision = (0.0 < tp_fp) ? ctr.true_positive_sum / tp_fp : 1.0;
+        recall = (0.0 < _true_total) ? ctr.true_positive_sum / _true_total : 0.0;
+
+        // We are maximizing precision, so that is the first part of the score.
+        pbs.first.push_back(precision);
+    }
+
+    // calculate recall_penalty
     score_t recall_penalty = get_threshold_penalty(recall);
     pbs.first.push_back(recall_penalty);
+
+    // Log precision, recall and penalty
     if (logger().isFineEnabled()) 
-        logger().fine("precision = %f  recall=%f  recall penalty=%e",
-                     precision, recall, recall_penalty);
+        logger().fine("prerec_bscore: precision = %f  "
+                      "recall=%f  recall penalty=%e",
+                      precision, recall, recall_penalty);
  
     // Add the Complexity penalty
     if (occam)
@@ -548,18 +682,17 @@ penalized_behavioral_score prerec_bscore::operator()(const combo_tree& tr) const
     return pbs;
 }
 
-/// Return the precision for this ctable row.
+/// Return an approximation for the precision that this ctable row(s)
+/// will contribute to the total precision.
 score_t prerec_bscore::get_variable(score_t pos, score_t neg, unsigned cnt) const
 {
-    contin_t best_possible_precision = pos / (cnt * _positive_total);
-    return best_possible_precision;
+    return pos / cnt;
 }
 
-/// Return the recall for this ctable row.
+/// Return the best-possible recall for this ctable row(s).
 score_t prerec_bscore::get_fixed(score_t pos, score_t neg, unsigned cnt) const
 {
-    contin_t best_possible_recall = 1.0 / _positive_total;
-    return best_possible_recall;
+    return pos / _true_total;
 }
 
 ////////////////
@@ -574,17 +707,20 @@ bep_bscore::bep_bscore(const CTable& ct,
 {
 }
 
-penalized_behavioral_score bep_bscore::operator()(const combo_tree& tr) const
+penalized_bscore bep_bscore::operator()(const combo_tree& tr) const
 {
     d_counts ctr = count(tr);
 
     // Compute normalized precision and recall.
-    score_t precision = ctr.true_positive_sum / (ctr.true_positive_sum + ctr.false_positive_sum);
-    score_t recall = ctr.true_positive_sum / (ctr.true_positive_sum + ctr.false_negative_sum);
+    score_t tp_fp = ctr.true_positive_sum + ctr.false_positive_sum;
+    score_t precision = (0.0 < tp_fp) ? ctr.true_positive_sum / tp_fp : 0.0;
+
+    score_t tp_fn = ctr.true_positive_sum + ctr.false_negative_sum;
+    score_t recall = (0.0 < tp_fn) ? ctr.true_positive_sum / tp_fn : 0.0;
 
     score_t bep = (precision + recall) / 2;
     // We are maximizing bep, so that is the first part of the score.
-    penalized_behavioral_score pbs;
+    penalized_bscore pbs;
     pbs.first.push_back(bep);
     
     score_t bep_diff = fabs(precision - recall);
@@ -606,16 +742,18 @@ penalized_behavioral_score bep_bscore::operator()(const combo_tree& tr) const
 /// Return the break-even-point for this ctable row.
 score_t bep_bscore::get_variable(score_t pos, score_t neg, unsigned cnt) const
 {
-    contin_t best_possible_precision = pos / (cnt * _positive_total);
-    contin_t best_possible_recall = 1.0 / _positive_total;
+    // XXX TODO FIXME is this really correct?
+    double best_possible_precision = pos / (cnt * _true_total);
+    double best_possible_recall = 1.0 / _true_total;
     return (best_possible_precision + best_possible_recall) / 2;
 }
 
 /// Return the difference for this ctable row.
 score_t bep_bscore::get_fixed(score_t pos, score_t neg, unsigned cnt) const
 {
-    contin_t best_possible_precision = pos / (cnt * _positive_total);
-    contin_t best_possible_recall = 1.0 / _positive_total;
+    // XXX TODO FIXME is this really correct?
+    double best_possible_precision = pos / (cnt);
+    double best_possible_recall = (0.0 < pos) ? 1.0 : 0.0;
     return fabs(best_possible_precision - best_possible_recall);
 }
 
@@ -634,21 +772,25 @@ f_one_bscore::f_one_bscore(const CTable& ct)
 {
 }
 
-penalized_behavioral_score f_one_bscore::operator()(const combo_tree& tr) const
+penalized_bscore f_one_bscore::operator()(const combo_tree& tr) const
 {
     d_counts ctr = count(tr);
 
     // Compute normalized precision and recall.
-    score_t precision = ctr.true_positive_sum / (ctr.true_positive_sum + ctr.false_positive_sum);
-    score_t recall = ctr.true_positive_sum / (ctr.true_positive_sum + ctr.false_negative_sum);
+    score_t tp_fp = ctr.true_positive_sum + ctr.false_positive_sum;
+    score_t precision = (0.0 < tp_fp) ? ctr.true_positive_sum / tp_fp : 0.0;
+
+    score_t tp_fn = ctr.true_positive_sum + ctr.false_negative_sum;
+    score_t recall = (0.0 < tp_fn) ? ctr.true_positive_sum / tp_fn : 0.0;
+
     score_t f_one = 2 * precision * recall / (precision + recall);
 
     // We are maximizing f_one, so that is the first part of the score.
-    penalized_behavioral_score pbs;
+    penalized_bscore pbs;
     pbs.first.push_back(f_one);
     
     if (logger().isFineEnabled()) 
-        logger().fine("precision = %f recall = %f f_one=%f",
+        logger().fine("f_one_bscore: precision = %f recall = %f f_one=%f",
                      precision, recall, f_one);
  
     // Add the Complexity penalty
@@ -664,17 +806,19 @@ penalized_behavioral_score f_one_bscore::operator()(const combo_tree& tr) const
 // generation of best-possible score.
 score_t f_one_bscore::get_fixed(score_t pos, score_t neg, unsigned cnt) const
 {
-    return 0.999999 / _ctable_usize; // since we add these together.
+    // XXX TODO FIXME is this really correct?
+    return 1.0;
 }
 
 /// Return the f_one for this ctable row.
 score_t f_one_bscore::get_variable(score_t pos, score_t neg, unsigned cnt) const
 {
-    contin_t best_possible_precision = pos / cnt;
-    contin_t best_possible_recall = 1.0;
-    contin_t f_one = 2 * best_possible_precision * best_possible_recall 
+    // XXX TODO FIXME is this really correct?
+    double best_possible_precision = pos / cnt;
+    double best_possible_recall = 1.0;
+    double f_one = 2 * best_possible_precision * best_possible_recall 
               / (best_possible_recall + best_possible_precision);
-    f_one /= _positive_total; // since we add these together.
+    f_one /= _true_total; // since we add these together.
     return f_one;
 }
 
@@ -697,13 +841,12 @@ precision_bscore::precision_bscore(const CTable& _ctable,
                                    bool positive_,
                                    bool worst_norm_,
                                    bool subtract_neg_target_)
-    : orig_ctable(_ctable), wrk_ctable(orig_ctable),
-      ctable_usize(orig_ctable.uncompressed_size()),
+    : ctable(_ctable), ctable_usize(ctable.uncompressed_size()),
       min_activation(min_activation_), max_activation(max_activation_),
       penalty(penalty_), positive(positive_), worst_norm(worst_norm_),
       subtract_neg_target(subtract_neg_target_), precision_full_bscore(true)
 {
-    output_type = wrk_ctable.get_output_type();
+    output_type = ctable.get_output_type();
     if (output_type == id::boolean_type) {
         // For boolean tables, sum the total number of 'T' values
         // in the output.  Ths sum represents the best possible score
@@ -752,7 +895,7 @@ precision_bscore::precision_bscore(const CTable& _ctable,
         // For contin tables, we search for the largest value in the table.
         // (or smallest, if positive == false)
         max_output = very_worst_score;
-        for (const auto& cr : wrk_ctable) {
+        for (const auto& cr : ctable) {
             const CTable::counter_t& c = cr.second;
             for (const auto& cv : c) {
                 score_t val = get_contin(cv.first);
@@ -799,13 +942,13 @@ void precision_bscore::set_complexity_coef(score_t ratio)
     logger().info() << "Precision scorer, complexity ratio = " << 1.0f/complexity_coef;
 }
 
-penalized_behavioral_score precision_bscore::operator()(const combo_tree& tr) const
+penalized_bscore precision_bscore::operator()(const combo_tree& tr) const
 {
-    penalized_behavioral_score pbs;
+    penalized_bscore pbs;
 
     // associate sum of worst outputs with number of observations for
     // that sum
-    multimap<contin_t, unsigned> worst_deciles;
+    multimap<double, unsigned> worst_deciles;
 
     // Initial precision. No hits means perfect precision :)
     // Yes, zero hits is common, early on.
@@ -813,13 +956,14 @@ penalized_behavioral_score precision_bscore::operator()(const combo_tree& tr) co
     unsigned active = 0;   // total number of active outputs by tr
     score_t sao = 0.0;     // sum of all active outputs (in the boolean case)
     
+    interpreter_visitor iv(tr);
+    auto interpret_tr = boost::apply_visitor(iv);
     if (precision_full_bscore) {
         // compute active and sum of all active outputs
-        for (const CTable::value_type& vct : wrk_ctable) {
-            const vertex_seq& iv = vct.first;
+        for (const CTable::value_type& vct : ctable) {
             const auto& ct = vct.second;
-            contin_t sumo = 0.0;
-            if (eval_binding(iv, tr) == id::logical_true) {
+            double sumo = 0.0;
+            if (interpret_tr(vct.first.get_variant()) == id::logical_true) {
                 sumo = sum_outputs(ct);
                 sao += sumo;
                 active += ct.total_count();
@@ -839,11 +983,11 @@ penalized_behavioral_score precision_bscore::operator()(const combo_tree& tr) co
     } else {
     
         // compute active and sum of all active outputs
-        for (const CTable::value_type& vct : wrk_ctable) {
+        for (const CTable::value_type& vct : ctable) {
             // vct.first = input vector
             // vct.second = counter of outputs
-            if (eval_binding(vct.first, tr) == id::logical_true) {
-                contin_t sumo = sum_outputs(vct.second);
+            if (interpret_tr(vct.first.get_variant()) == id::logical_true) {
+                double sumo = sum_outputs(vct.second);
                 unsigned totalc = vct.second.total_count();
                 // For boolean tables, sao == sum of all true positives,
                 // and active == sum of true+false positives.
@@ -858,7 +1002,7 @@ penalized_behavioral_score precision_bscore::operator()(const combo_tree& tr) co
 
         // remove all observations from worst_norm so that only the worst
         // n_deciles or less remains and compute its average
-        contin_t avg_worst_deciles = 0.0;
+        double avg_worst_deciles = 0.0;
         if (worst_norm and sao > 0) {
             unsigned worst_count = 0,
                 n_deciles = active / 10;
@@ -914,17 +1058,18 @@ behavioral_score precision_bscore::best_possible_bscore() const
     // Also store the sumo and total, so that they don't need to be
     // recomputed later.  Note that this routine could be performance
     // critical if used as a fitness function for feature selection
-    // (which is actually being done).
-    typedef std::multimap<contin_t, std::pair<contin_t, // sum_outputs
-                                              unsigned> // total count
+    // (which is the case).
+    typedef std::multimap<contin_t,           // precision
+                          std::pair<contin_t, // sum_outputs
+                                    unsigned> // total count
                           > max_precisions_t;
     max_precisions_t max_precisions;
-    for (CTable::const_iterator it = wrk_ctable.begin();
-         it != wrk_ctable.end(); ++it) {
+    for (CTable::const_iterator it = ctable.begin();
+         it != ctable.end(); ++it) {
         const CTable::counter_t& c = it->second;
-        contin_t sumo = sum_outputs(c);
+        double sumo = sum_outputs(c);
         unsigned total = c.total_count();
-        contin_t precision = sumo / total;
+        double precision = sumo / total;
         auto lmnt = std::make_pair(precision, std::make_pair(sumo, total));
         max_precisions.insert(lmnt);
     }
@@ -991,16 +1136,6 @@ score_t precision_bscore::min_improv() const
     return 1.0 / ctable_usize;
 }
 
-void precision_bscore::ignore_idxs(std::set<arity_t>& idxs) const
-{
-    // Get permitted idxs.
-    auto irng = boost::irange(0, orig_ctable.get_arity());
-    std::set<arity_t> all_idxs(irng.begin(), irng.end());
-    std::set<arity_t> permitted_idxs = opencog::set_difference(all_idxs, idxs);
-
-    // Filter orig_table with permitted idxs.
-    wrk_ctable = orig_ctable.filtered_preverse_idxs(permitted_idxs);
-}
 
 combo_tree precision_bscore::gen_canonical_best_candidate() const
 {
@@ -1012,16 +1147,16 @@ combo_tree precision_bscore::gen_canonical_best_candidate() const
     // recomputed later.  Note that this routine could be performance
     // critical if used as a fitness function for feature selection
     // (which is planned).
-    typedef std::multimap<contin_t, // precision
+    typedef std::multimap<double, // precision
                           std::pair<CTable::const_iterator,
                                     unsigned> // total count
                           > precision_to_count_t;
     precision_to_count_t ptc;
-    for (CTable::const_iterator it = wrk_ctable.begin();
-         it != wrk_ctable.end(); ++it) {
+    for (CTable::const_iterator it = ctable.begin();
+         it != ctable.end(); ++it) {
         const CTable::counter_t& c = it->second;
         unsigned total = c.total_count();
-        contin_t precision = sum_outputs(c) / total;
+        double precision = sum_outputs(c) / total;
         ptc.insert(std::make_pair(precision, std::make_pair(it, total)));
     }
 
@@ -1043,7 +1178,7 @@ combo_tree precision_bscore::gen_canonical_best_candidate() const
         // build the disjunctive clause
         auto dch = tr.append_child(head, id::logical_and);
         arity_t idx = 1;
-        for (const auto& input : v.second.first->first) {
+        for (const auto& input : v.second.first->first.get_seq<builtin>()) {
             argument arg(input == id::logical_true? idx++ : -idx++);
             tr.append_child(dch, arg);
         }
@@ -1062,8 +1197,7 @@ combo_tree precision_bscore::gen_canonical_best_candidate() const
 precision_conj_bscore::precision_conj_bscore(const CTable& _ctable,
                                              float hardness_,
                                              bool positive_)
-    : orig_ctable(_ctable), wrk_ctable(orig_ctable),
-      ctable_usize(orig_ctable.uncompressed_size()),
+    : ctable(_ctable), ctable_usize(ctable.uncompressed_size()),
       hardness(hardness_), positive(positive_)
 {
     vertex target = bool_to_vertex(positive);
@@ -1105,18 +1239,20 @@ void precision_conj_bscore::set_complexity_coef(score_t ratio)
     logger().info() << "Precision scorer, complexity ratio = " << 1.0f/complexity_coef;
 }
 
-penalized_behavioral_score precision_conj_bscore::operator()(const combo_tree& tr) const
+penalized_bscore precision_conj_bscore::operator()(const combo_tree& tr) const
 {
-    penalized_behavioral_score pbs;
+    penalized_bscore pbs;
 
     // compute active and sum of all active outputs
     unsigned active = 0;   // total number of active outputs by tr
     score_t sao = 0.0;     // sum of all active outputs (in the boolean case)
-    for (const CTable::value_type& vct : wrk_ctable) {
+    interpreter_visitor iv(tr);
+    auto interpret_tr = boost::apply_visitor(iv);
+    for (const CTable::value_type& vct : ctable) {
         // vct.first = input vector
         // vct.second = counter of outputs
-        if (eval_binding(vct.first, tr) == id::logical_true) {
-            contin_t sumo = sum_outputs(vct.second);
+        if (interpret_tr(vct.first.get_variant()) == id::logical_true) {
+            double sumo = sum_outputs(vct.second);
             unsigned totalc = vct.second.total_count();
             // For boolean tables, sao == sum of all true positives,
             // and active == sum of true+false positives.
@@ -1168,17 +1304,6 @@ score_t precision_conj_bscore::min_improv() const
     return 0.0;
     // return 1.0 / ctable_usize;
 }
-
-void precision_conj_bscore::ignore_idxs(std::set<arity_t>& idxs) const {
-    // get permitted idxs
-    auto irng = boost::irange(0, orig_ctable.get_arity());
-    std::set<arity_t> all_idxs(irng.begin(), irng.end());
-    std::set<arity_t> permitted_idxs = opencog::set_difference(all_idxs, idxs);
-
-    // filter orig_table with permitted idxs
-    wrk_ctable = orig_ctable.filtered_preverse_idxs(permitted_idxs);
-}
-
 
 //////////////////////////////
 // discretize_contin_bscore //
@@ -1245,14 +1370,14 @@ size_t discretize_contin_bscore::class_idx_within(contin_t v,
         return class_idx_within(v, m_idx, u_idx);
 }
 
-penalized_behavioral_score discretize_contin_bscore::operator()(const combo_tree& tr) const
+penalized_bscore discretize_contin_bscore::operator()(const combo_tree& tr) const
 {
     /// @todo could be optimized by avoiding computing the OTable and
     /// directly using the results on the fly. On really big table
     /// (dozens of thousands of data points and about 100 inputs, this
     /// has overhead of about 10% of the overall time)
     OTable ct(tr, cit);
-    penalized_behavioral_score pbs(
+    penalized_bscore pbs(
         make_pair<behavioral_score, score_t>(behavioral_score(target.size()), 0));
     boost::transform(ct, classes, pbs.first.begin(), [&](const vertex& v, size_t c_idx) {
             return (c_idx != this->class_idx(get_contin(v))) * this->weights[c_idx];
@@ -1273,17 +1398,19 @@ penalized_behavioral_score discretize_contin_bscore::operator()(const combo_tree
 // ctruth_table_bscore //
 /////////////////////////
         
-penalized_behavioral_score ctruth_table_bscore::operator()(const combo_tree& tr) const
+penalized_bscore ctruth_table_bscore::operator()(const combo_tree& tr) const
 {
-    //penalized_behavioral_score pbs(
+    //penalized_bscore pbs(
     //    make_pair<behavioral_score, score_t>(behavioral_score(target.size()), 0));
-    penalized_behavioral_score pbs;
+    penalized_bscore pbs;
 
+    interpreter_visitor iv(tr);
+    auto interpret_tr = boost::apply_visitor(iv);
     // Evaluate the bscore components for all rows of the ctable
     for (const CTable::value_type& vct : ctable) {
-        const vertex_seq& vs = vct.first;
         const CTable::counter_t& c = vct.second;
-        pbs.first.push_back(-score_t(c.get(negate_vertex(eval_binding(vs, tr)))));
+        score_t sc = c.get(negate_vertex(interpret_tr(vct.first.get_variant())));
+        pbs.first.push_back(-sc);
     }
 
     // Add the Occam's razor feature
@@ -1324,16 +1451,17 @@ score_t ctruth_table_bscore::min_improv() const
 // enum_table_bscore //
 /////////////////////////
         
-penalized_behavioral_score enum_table_bscore::operator()(const combo_tree& tr) const
+penalized_bscore enum_table_bscore::operator()(const combo_tree& tr) const
 {
-    penalized_behavioral_score pbs;
+    penalized_bscore pbs;
 
     // Evaluate the bscore components for all rows of the ctable
+    interpreter_visitor iv(tr);
+    auto interpret_tr = boost::apply_visitor(iv);
     for (const CTable::value_type& vct : ctable) {
-        const vertex_seq& vs = vct.first;
         const CTable::counter_t& c = vct.second;
         // The number that are wrong equals total minus num correct.
-        score_t sc = score_t(c.get(eval_binding(vs, tr)));
+        score_t sc = score_t(c.get(interpret_tr(vct.first.get_variant())));
         sc -= score_t(c.total_count());
         pbs.first.push_back(sc);
     }
@@ -1378,9 +1506,9 @@ score_t enum_table_bscore::min_improv() const
 // enum_filter_bscore //
 /////////////////////////
         
-penalized_behavioral_score enum_filter_bscore::operator()(const combo_tree& tr) const
+penalized_bscore enum_filter_bscore::operator()(const combo_tree& tr) const
 {
-    penalized_behavioral_score pbs;
+    penalized_bscore pbs;
 
     typedef combo_tree::sibling_iterator sib_it;
     typedef combo_tree::iterator pre_it;
@@ -1394,18 +1522,20 @@ penalized_behavioral_score enum_filter_bscore::operator()(const combo_tree& tr) 
     vertex consequent = *next(predicate);
 
     // Evaluate the bscore components for all rows of the ctable
+    interpreter_visitor iv_tr(tr), iv_predicate(predicate);
+    auto interpret_tr = boost::apply_visitor(iv_tr);
+    auto interpret_predicate = boost::apply_visitor(iv_predicate);
     for (const CTable::value_type& vct : ctable) {
-        const vertex_seq& vs = vct.first;
         const CTable::counter_t& c = vct.second;
 
         unsigned total = c.total_count();
 
         // The number that are wrong equals total minus num correct.
-        score_t sc = score_t(c.get(eval_binding(vs, tr)));
+        score_t sc = score_t(c.get(interpret_tr(vct.first.get_variant())));
         sc -= score_t(total);
 
         // Punish the first predicate, if it is wrong.
-        vertex pr = eval_throws_binding(vs, predicate);
+        vertex pr = interpret_predicate(vct.first.get_variant());
         if (pr == id::logical_true) {
             if (total != c.get(consequent))
                 sc -= punish * total;
@@ -1454,9 +1584,9 @@ score_t enum_graded_bscore::graded_complexity(combo_tree::iterator it) const
     return cpxy;
 }
         
-penalized_behavioral_score enum_graded_bscore::operator()(const combo_tree& tr) const
+penalized_bscore enum_graded_bscore::operator()(const combo_tree& tr) const
 {
-    penalized_behavioral_score pbs;
+    penalized_bscore pbs;
 
     typedef combo_tree::sibling_iterator sib_it;
     typedef combo_tree::iterator pre_it;
@@ -1465,17 +1595,17 @@ penalized_behavioral_score enum_graded_bscore::operator()(const combo_tree& tr) 
     if (is_enum_type(*it)) 
         return enum_table_bscore::operator()(tr);
 
-    OC_ASSERT(*it == id::cond, "Error: unexpcected candidate!");
+    OC_ASSERT(*it == id::cond, "Error: unexpected candidate!");
 
     // Evaluate the bscore components for all rows of the ctable
+    // TODO
+    sib_it predicate = it.begin();
     for (const CTable::value_type& vct : ctable) {
-        const vertex_seq& vs = vct.first;
         const CTable::counter_t& c = vct.second;
 
         unsigned total = c.total_count();
         score_t weight = 1.0;
 
-        sib_it predicate = it.begin();
         // The number that are wrong equals total minus num correct.
         score_t sc = -score_t(total);
         while (1) {
@@ -1488,7 +1618,8 @@ penalized_behavioral_score enum_graded_bscore::operator()(const combo_tree& tr) 
             }
     
             // The first true predicate terminates.
-            vertex pr = eval_throws_binding(vs, predicate);
+            interpreter_visitor iv(predicate);
+            vertex pr = boost::apply_visitor(iv, vct.first.get_variant());
             if (pr == id::logical_true) {
                 vertex consequent = *next(predicate);
                 sc += c.get(consequent);
@@ -1527,9 +1658,9 @@ score_t enum_graded_bscore::min_improv() const
 // inner and outer loops.  This makes the algo slower and bulkier, but
 // it does allow the effectiveness of predicates to be tracked.
 //
-penalized_behavioral_score enum_effective_bscore::operator()(const combo_tree& tr) const
+penalized_bscore enum_effective_bscore::operator()(const combo_tree& tr) const
 {
-    penalized_behavioral_score pbs;
+    penalized_bscore pbs;
 
     typedef combo_tree::sibling_iterator sib_it;
     typedef combo_tree::iterator pre_it;
@@ -1591,13 +1722,13 @@ penalized_behavioral_score enum_effective_bscore::operator()(const combo_tree& t
         vector<bool>::iterator dit = done.begin();
 
         bool effective = false;
+        interpreter_visitor iv(predicate);
+        auto interpret_predicate = boost::apply_visitor(iv);
         for (const CTable::value_type& vct : ctable) {
             if (*dit == false) {
-                const vertex_seq& vs = vct.first;
-                const CTable::counter_t& c = vct.second;
-
-                vertex pr = eval_throws_binding(vs, predicate);
+                vertex pr = interpret_predicate(vct.first.get_variant());
                 if (pr == id::logical_true) {
+                    const CTable::counter_t& c = vct.second;
                     int sc = c.get(consequent);
                     // A predicate is effective if it evaluates to true,
                     // and at least gets a right answr when it does...
@@ -1669,7 +1800,7 @@ interesting_predicate_bscore::interesting_predicate_bscore(const CTable& ctable_
     logger().fine("skewness = %f", skewness);
 }
 
-penalized_behavioral_score interesting_predicate_bscore::operator()(const combo_tree& tr) const
+penalized_bscore interesting_predicate_bscore::operator()(const combo_tree& tr) const
 {
     OTable pred_ot(tr, ctable);
 
@@ -1689,7 +1820,7 @@ penalized_behavioral_score interesting_predicate_bscore::operator()(const combo_
     logger().fine("total = %u", total);
     logger().fine("actives = %u", actives);
 
-    penalized_behavioral_score pbs;
+    penalized_bscore pbs;
     behavioral_score &bs = pbs.first;
 
     // filter the output according to pred_ot
@@ -1819,11 +1950,11 @@ score_t interesting_predicate_bscore::min_improv() const
 //////////////////////////////
 
 // main operator
-penalized_behavioral_score multibscore_based_bscore::operator()(const combo_tree& tr) const
+penalized_bscore multibscore_based_bscore::operator()(const combo_tree& tr) const
 {
-    penalized_behavioral_score pbs;
+    penalized_bscore pbs;
     for (const bscore_base& bsc : _bscorers) {
-        penalized_behavioral_score apbs = bsc(tr);
+        penalized_bscore apbs = bsc(tr);
         boost::push_back(pbs.first, apbs.first);
         pbs.second += apbs.second;
     }
@@ -1832,11 +1963,11 @@ penalized_behavioral_score multibscore_based_bscore::operator()(const combo_tree
 
 behavioral_score multibscore_based_bscore::best_possible_bscore() const
 {
-    penalized_behavioral_score pbs;
+    behavioral_score bs;
     for (const bscore_base& bsc : _bscorers) {
-        boost::push_back(pbs.first, bsc.best_possible_bscore());
+        boost::push_back(bs, bsc.best_possible_bscore());
     }
-    return pbs;
+    return bs;
 }
 
 // return the min of all min_improv
@@ -1849,13 +1980,6 @@ score_t multibscore_based_bscore::min_improv() const
         res = min(res, bs.min_improv());
     return res;
 }
-
-void multibscore_based_bscore::ignore_idxs(std::set<arity_t>& idxs) const
-{
-    for (const bscore_base& bs : _bscorers)
-        bs.ignore_idxs(idxs);
-}
-
 
 } // ~namespace moses
 } // ~namespace opencog
