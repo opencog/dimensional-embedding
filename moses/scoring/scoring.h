@@ -1,5 +1,5 @@
 /*
- * opencog/learning/moses/moses/scoring.h
+ * opencog/learning/moses/scoring/scoring.h
  *
  * Copyright (C) 2002-2008 Novamente LLC
  * Copyright (C) 2012 Poulin Holdings
@@ -43,9 +43,9 @@
 
 #include <opencog/comboreduct/table/table.h>
 
-#include "using.h"
+#include "../moses/using.h"
+#include "../moses/types.h"
 #include "../representation/representation.h"
-#include "types.h"
 
 namespace opencog { namespace moses {
 
@@ -60,30 +60,35 @@ struct cscore_base : public unary_function<combo_tree, composite_score>
     // the best possible score is reached. If not overloaded it will
     // return best_score (constant defined under
     // opencog/learning/moses/moses/types.h)
-    score_t best_possible_score() { return very_best_score; }
+    virtual score_t best_possible_score() const { return very_best_score; }
 
     // Return the minimum value considered for improvement (by
     // default return 0)
-    score_t min_improv() { return 0.0; }
+    virtual score_t min_improv() const { return 0.0; }
 
     // In case the fitness function can be sped-up when certain
-    // arguments are ignored. The arguments are indicated as set of
-    // values of the idx-1 when idx is the argument idx. So {1, 3}
-    // corresponds to the arguments {$2, $4}. The method provided by
-    // default does nothing (no speed-up).
-    void ignore_idxs(set<arity_t>&) const {}
+    // features are ignored. The features are indicated as set of
+    // indices (from 0). The method provided by default does nothing
+    // (no speed-up).
+    //
+    // There is also another case. When a new deme is spawn if some
+    // features are ignored then the best_possible_score might be
+    // lower, it's good to compute it in order to stop deme search. If
+    // ignore_idxs is set then best_possible_score() can be recalled
+    // to get thta new ma score value.
+    virtual void ignore_idxs(const set<arity_t>&) const {}
 
     virtual ~cscore_base(){}
 };
 
 // Abstract bscoring function class to implement
-struct bscore_base : public unary_function<combo_tree, penalized_behavioral_score>
+struct bscore_base : public unary_function<combo_tree, penalized_bscore>
 {
     bscore_base() : occam(false), complexity_coef(0.0) {};
     virtual ~bscore_base() {};
 
     // Evaluate the candidate tr
-    virtual penalized_behavioral_score operator()(const combo_tree& tr) const = 0;
+    virtual penalized_bscore operator()(const combo_tree& tr) const = 0;
 
     // Return the best possible bscore achievable with that fitness
     // function. This is useful in order to stop running MOSES when
@@ -92,17 +97,16 @@ struct bscore_base : public unary_function<combo_tree, penalized_behavioral_scor
 
     // Return the minimum value considered for improvement (by defaut
     // return 0)
-    score_t min_improv() const { return 0.0; }
+    virtual score_t min_improv() const { return 0.0; }
 
     // In case the fitness function can be sped-up when certain
-    // arguments are ignored. The arguments are indicated as set of
-    // values of the idx-1 when idx is the argument idx. So {1, 3}
-    // corresponds to the arguments {$2, $4}. The method provided by
-    // default does nothing (no speed-up).
-    void ignore_idxs(set<arity_t>&) const {}
+    // features are ignored. The features are indicated as set of
+    // indices (from 0). The method provided by default does nothing
+    // (no speed-up).
+    virtual void ignore_idxs(const set<arity_t>&) const {}
 
-    void set_complexity_coef(score_t complexity_ratio);
-    void set_complexity_coef(unsigned alphabet_size, float p);
+    virtual void set_complexity_coef(score_t complexity_ratio);
+    virtual void set_complexity_coef(unsigned alphabet_size, float p);
 
 protected:
     bool occam; // If true, then Occam's razor is taken into account.
@@ -116,8 +120,11 @@ protected:
  *      score = sum_f BScore(f) + penalty
  *
  * This is a "minor" helper class, and exists for two reasons:
- * 1)  avoids some redundancy of having the summation in many places
+ * 1) avoids some redundancy of having the summation in many places
  * 2) Helps with keeping the score-caching code cleaner.
+ *
+ * TODO: could be detemplatized, it's only instantiated with
+ * bscore_base.
  */
 template<typename PBScorer>
 struct bscore_based_cscore : public cscore_base
@@ -127,7 +134,7 @@ struct bscore_based_cscore : public cscore_base
     composite_score operator()(const combo_tree& tr) const
     {
         try {
-            penalized_behavioral_score pbs = _pbscorer(tr);
+            penalized_bscore pbs = _pbscorer(tr);
             return operator()(pbs, tree_complexity(tr));
         }
         catch (EvalException& ee)
@@ -150,7 +157,7 @@ struct bscore_based_cscore : public cscore_base
     }
 
     // Hmmm, this could be static, actually ... 
-    composite_score operator()(const penalized_behavioral_score& pbs,
+    composite_score operator()(const penalized_bscore& pbs,
                                complexity_t cpxy) const
     {
         const behavioral_score &bs = pbs.first;
@@ -179,7 +186,11 @@ struct bscore_based_cscore : public cscore_base
         return _pbscorer.min_improv();
     }
 
-    void ignore_idxs(std::set<arity_t>& idxs) const {
+    // In case the fitness function can be sped-up when certain
+    // features are ignored. The features are indicated as set of
+    // indices (from 0).
+    void ignore_idxs(const set<arity_t>& idxs) const
+    {
         _pbscorer.ignore_idxs(idxs);
     }
 
@@ -200,14 +211,17 @@ struct multibscore_based_bscore : public bscore_base
     multibscore_based_bscore(const BScorerSeq& bscorers) : _bscorers(bscorers) {}
 
     // main operator
-    penalized_behavioral_score operator()(const combo_tree& tr) const;
+    penalized_bscore operator()(const combo_tree& tr) const;
 
     behavioral_score best_possible_bscore() const;
 
     // return the min of all min_improv
     score_t min_improv() const;
 
-    void ignore_idxs(std::set<arity_t>& idxs) const;
+    // In case the fitness function can be sped-up when certain
+    // features are ignored. The features are indicated as set of
+    // indices (from 0).
+    void ignore_idxs(const set<arity_t>&) const;
 
 protected:
     const BScorerSeq& _bscorers;
@@ -226,7 +240,7 @@ struct logical_bscore : public bscore_base
     logical_bscore(const combo_tree& tr, int a)
             : target(tr, a), arity(a) {}
 
-    penalized_behavioral_score operator()(const combo_tree& tr) const;
+    penalized_bscore operator()(const combo_tree& tr) const;
 
     behavioral_score best_possible_bscore() const;
 
@@ -281,13 +295,27 @@ struct discriminator
     };
     d_counts count(const combo_tree&) const;
 
+    // Like count but do the counting for each datapoint (each row of
+    // the ctable). This is useful for finer grain bscore (see
+    // variable discriminator_bscore::full_bscore)
+    std::vector<d_counts> counts(const combo_tree&) const;
+
 protected:
     CTable _ctable;
     type_node _output_type;
-    score_t _positive_total;
-    score_t _negative_total;
+    score_t _true_total;        // total number of Ts in the ctable
+    score_t _false_total;       // total number of Fs in the ctable
 
-    std::function<score_t(const CTable::counter_t&)> sum_outputs;
+    // Regarding the 2 functions below (sum_pos and sum_neg):
+    //
+    // When the output type is contin then the notion of
+    // positive/negative is fuzzy, with degree corresponding to the
+    // weight of the contin value.
+
+    // give a ctable's row return the sum of true positives
+    std::function<score_t(const CTable::counter_t&)> sum_true;
+    // give a ctable's row return the sum of false positives
+    std::function<score_t(const CTable::counter_t&)> sum_false;
 };
 
 /**
@@ -315,7 +343,7 @@ struct discriminating_bscore : public bscore_base, discriminator
 protected:
     //* The two functions below are used to implement a generic
     //* best_possible_bscore() method.  They should return values
-    //* the the two conjugate classification dimensions.  For example,
+    //* the two conjugate classification dimensions.  For example,
     //* one might return precision, and the other recall.  The 'fixed'
     //* quantity is the one meant to be kept above a given threshold,
     //* while the 'variable' one is to be maximized (while keeping the
@@ -352,6 +380,15 @@ protected:
     float _min_threshold;
     float _max_threshold;
     float _hardness;
+
+    // if enabled then each datapoint is an entry in the bscore
+    // corresponding to its contribution to the variable score
+    // component, and the last element of the bscore correspong to the
+    // fix score component (like when disabled).
+    //
+    // All the datapoint contributions should sum up to the overall
+    // variable score
+    bool _full_bscore;
 };
 
 /**
@@ -365,7 +402,7 @@ struct recall_bscore : public discriminating_bscore
                   float max_precision = 1.0f,
                   float hardness = 1.0f);
 
-    penalized_behavioral_score operator()(const combo_tree& tr) const;
+    penalized_bscore operator()(const combo_tree& tr) const;
 
 protected:
     virtual score_t get_fixed(score_t pos, score_t neg, unsigned cnt) const;
@@ -383,7 +420,7 @@ struct prerec_bscore : public discriminating_bscore
                   float max_recall = 1.0f,
                   float hardness = 1.0f);
 
-    penalized_behavioral_score operator()(const combo_tree& tr) const;
+    penalized_bscore operator()(const combo_tree& tr) const;
 
 protected:
     virtual score_t get_fixed(score_t pos, score_t neg, unsigned cnt) const;
@@ -405,7 +442,7 @@ struct bep_bscore : public discriminating_bscore
                float max_diff = 0.5f,
                float hardness = 1.0f);
 
-    penalized_behavioral_score operator()(const combo_tree& tr) const;
+    penalized_bscore operator()(const combo_tree& tr) const;
 
 protected:
     virtual score_t get_fixed(score_t pos, score_t neg, unsigned cnt) const;
@@ -419,7 +456,7 @@ protected:
 struct f_one_bscore : public discriminating_bscore
 {
     f_one_bscore(const CTable& _ctable);
-    penalized_behavioral_score operator()(const combo_tree& tr) const;
+    penalized_bscore operator()(const combo_tree& tr) const;
 
 protected:
     virtual score_t get_fixed(score_t pos, score_t neg, unsigned cnt) const;
@@ -509,10 +546,9 @@ struct precision_bscore : public bscore_base
                      float min_activation = 0.5f,
                      float max_activation = 1.0f,
                      bool positive = true,
-                     bool worst_norm = false,
-                     bool subtract_neg_target = false);
+                     bool worst_norm = false);
 
-    penalized_behavioral_score operator()(const combo_tree& tr) const;
+    penalized_bscore operator()(const combo_tree& tr) const;
 
     // Return the best possible bscore. Used as one of the
     // termination conditions (when the best bscore is reached).
@@ -524,7 +560,7 @@ struct precision_bscore : public bscore_base
      * Filter the table with all permitted idxs (the complementary
      * with [0..arity).
      */
-    void ignore_idxs(std::set<arity_t>& idxs) const;
+    void ignore_idxs(const set<arity_t>&) const;
 
     void set_complexity_coef(score_t complexity_ratio);
     void set_complexity_coef(unsigned alphabet_size, float stddev);
@@ -556,9 +592,12 @@ protected:
     const CTable& orig_ctable;  // ref to the original table
 
     // table actually used for the evaluation. It is mutable because
-    // we want to be able to change it to ignore some features (it
-    // speeds-up evaluation)
+    // we want to be able to change it to ignore some features (it may
+    // speed-up evaluation)
     mutable CTable wrk_ctable;
+
+    // for debugging, keep that around till we fix best_possible_bscore
+    // mutable CTable fully_filtered_ctable;
     
     size_t ctable_usize;   // uncompressed size of ctable
     score_t min_activation, max_activation;
@@ -566,7 +605,7 @@ protected:
                         // boolean). This is used to normalized the
                         // precision in case the output isn't boolean.
     score_t penalty;
-    bool positive, worst_norm, subtract_neg_target;
+    bool positive, worst_norm;
 
     // if enabled then each datapoint is an entry in the bscore (its
     // part contributing to the precision, and the activation penalty
@@ -578,6 +617,7 @@ protected:
 
 private:
     score_t get_activation_penalty(score_t activation) const;
+
     // function to calculate the total weight of the observations
     // associated to an input vector
     std::function<score_t(const CTable::counter_t&)> sum_outputs;
@@ -592,7 +632,7 @@ struct precision_conj_bscore : public bscore_base
     precision_conj_bscore(const CTable& _ctable, float hardness,
                           bool positive = true);
 
-    penalized_behavioral_score operator()(const combo_tree& tr) const;
+    penalized_bscore operator()(const combo_tree& tr) const;
 
     // Return the best possible bscore. Used as one of the
     // termination conditions (when the best bscore is reached).
@@ -600,22 +640,11 @@ struct precision_conj_bscore : public bscore_base
 
     score_t min_improv() const;
 
-    /**
-     * Filter the table with all permitted idxs (the complementary
-     * with [0..arity).
-     */
-    void ignore_idxs(std::set<arity_t>& idxs) const;
-
     void set_complexity_coef(score_t complexity_ratio);
     void set_complexity_coef(unsigned alphabet_size, float stddev);
     
 protected:
-    const CTable& orig_ctable;  // ref to the original table
-
-    // table actually used for the evaluation. It is mutable because
-    // we want to be able to change it to ignore some features (it
-    // speeds-up evaluation)
-    mutable CTable wrk_ctable;
+    const CTable& ctable;
     
     size_t ctable_usize;   // uncompressed size of ctable
     float hardness;
@@ -649,7 +678,7 @@ struct discretize_contin_bscore : public bscore_base
     //                          bool weighted_average,
     //                          float alphabet_size, float p);
 
-    penalized_behavioral_score operator()(const combo_tree& tr) const;
+    penalized_bscore operator()(const combo_tree& tr) const;
 
     // The best possible bscore is a vector of zeros. That's probably
     // not quite true, because there could be duplicated inputs, but
@@ -690,6 +719,10 @@ protected:
  * The math justifying the program size penalty equations is based on
  * the following thread
  * http://groups.google.com/group/opencog-news/browse_thread/thread/b7704419e082c6f1
+ *
+ * It turns out this is closely related to the Akaike Information
+ * Criterion, see in particular
+ * http://en.wikipedia.org/wiki/Akaike_information_criterion#Relevance_to_chi-squared_fitting
  *
  * Here's a summary:
  * Let M == model (the combo program being learned)
@@ -764,7 +797,7 @@ struct contin_bscore : public bscore_base
         init(eft);
     }
 
-    penalized_behavioral_score operator()(const combo_tree& tr) const;
+    penalized_bscore operator()(const combo_tree& tr) const;
 
     // The best possible bscore is a vector of zeros. That's probably
     // not quite true, because there could be duplicated inputs, but
@@ -913,7 +946,7 @@ struct ctruth_table_bscore : public bscore_base
     {}
     ctruth_table_bscore(const CTable& _ctt) : ctable(_ctt) {}
 
-    penalized_behavioral_score operator()(const combo_tree& tr) const;
+    penalized_bscore operator()(const combo_tree& tr) const;
 
     // Return the best possible bscore. Used as one of the
     // termination conditions (when the best bscore is reached).
@@ -953,7 +986,7 @@ struct enum_table_bscore : public bscore_base
 {
     enum_table_bscore(const CTable& _ctt) : ctable(_ctt) {}
 
-    penalized_behavioral_score operator()(const combo_tree& tr) const;
+    penalized_bscore operator()(const combo_tree& tr) const;
 
     // Return the best possible bscore. Used as one of the
     // termination conditions (when the best bscore is reached).
@@ -991,7 +1024,7 @@ struct enum_filter_bscore : public enum_table_bscore
         : enum_table_bscore(_ctt), punish(1.0)
     {}
 
-    penalized_behavioral_score operator()(const combo_tree& tr) const;
+    penalized_bscore operator()(const combo_tree& tr) const;
 
     score_t punish;
 };
@@ -1035,7 +1068,7 @@ struct enum_graded_bscore : public enum_table_bscore
         : enum_table_bscore(_ctt), grading(0.9)
     {}
 
-    penalized_behavioral_score operator()(const combo_tree& tr) const;
+    penalized_bscore operator()(const combo_tree& tr) const;
 
     virtual score_t min_improv() const;
 
@@ -1060,7 +1093,7 @@ struct enum_effective_bscore : public enum_graded_bscore
         : enum_graded_bscore(_ctt), _ctable_usize(_ctt.uncompressed_size())
     {}
 
-    penalized_behavioral_score operator()(const combo_tree& tr) const;
+    penalized_bscore operator()(const combo_tree& tr) const;
 protected:
     size_t _ctable_usize;
 };
@@ -1103,7 +1136,7 @@ struct interesting_predicate_bscore : public bscore_base
                                  bool positive = true,
                                  bool abs_skewness = false,
                                  bool decompose_kld = false);
-    penalized_behavioral_score operator()(const combo_tree& tr) const;
+    penalized_bscore operator()(const combo_tree& tr) const;
 
     // the KLD has no upper boundary so the best of possible score is
     // the maximum value a behavioral_score can represent
