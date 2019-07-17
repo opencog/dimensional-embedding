@@ -3,15 +3,9 @@ ADD_LIBRARY (dimensionalembedding SHARED
 	CoverTreePoint
 )
 
-IF (CYGWIN)
-	INSTALL (TARGETS dimensionalembedding
-		DESTINATION "lib${LIB_DIR_SUFFIX}/opencog"
-	)
-ELSE (CYGWIN)
-	INSTALL (TARGETS dimensionalembedding
-		LIBRARY DESTINATION "lib${LIB_DIR_SUFFIX}/opencog"
-	)
-ENDIF (CYGWIN)
+INSTALL (TARGETS dimensionalembedding
+	LIBRARY DESTINATION "lib${LIB_DIR_SUFFIX}/opencog"
+)
 
 TARGET_LINK_LIBRARIES (dimensionalembedding
 	server
