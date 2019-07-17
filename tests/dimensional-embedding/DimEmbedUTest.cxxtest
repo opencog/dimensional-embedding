@@ -1,5 +1,5 @@
 /*
- * opencog/tests/learning/dimensionalembedding/DimEmbedUTest.cxxtest
+ * opencog/tests/dimensional-embedding/DimEmbedUTest.cxxtest
  *
  * Copyright (C) 2010 by OpenCog Foundation
  * All Rights Reserved
@@ -30,7 +30,7 @@
 #include <opencog/atomspace/AtomSpace.h>
 #include <opencog/cogserver/server/CogServer.h>
 
-#include <opencog/learning/dimensionalembedding/DimEmbedModule.h>
+#include <opencog/dimensional-embedding/DimEmbedModule.h>
 
 using namespace opencog;
 

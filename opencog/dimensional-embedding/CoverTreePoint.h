@@ -1,5 +1,5 @@
 /*
- * opencog/learning/dimensionalembedding/CoverTreePoint.h
+ * opencog/dimensional-embedding/CoverTreePoint.h
  *
  * Copyright (C) 2011 by OpenCog Foundation
  * All Rights Reserved
@@ -30,7 +30,7 @@
 #include <opencog/util/numeric.h>
 
 #include <opencog/atomspace/AtomSpace.h>
-#include <opencog/learning/dimensionalembedding/DimEmbedModule.h>
+#include <opencog/dimensional-embedding/DimEmbedModule.h>
 
 /**
  * The CoverTreePoint class and its methods are required by the cover tree

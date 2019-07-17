@@ -1,5 +1,5 @@
 /*
- * opencog/learning/dimensionalembedding/DimEmbedModule.h
+ * opencog/dimensional-embedding/DimEmbedModule.h
  *
  * Copyright (C) 2010 by OpenCog Foundation
  * All Rights Reserved

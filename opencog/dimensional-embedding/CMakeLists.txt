@@ -1,14 +1,14 @@
-ADD_LIBRARY (dimensionalembedding SHARED
+ADD_LIBRARY (dimensional-embedding SHARED
 	DimEmbedModule
 	CoverTreePoint
 )
 
-INSTALL (TARGETS dimensionalembedding
+INSTALL (TARGETS dimensional-embedding
 	LIBRARY DESTINATION "lib${LIB_DIR_SUFFIX}/opencog"
 )
 
-TARGET_LINK_LIBRARIES (dimensionalembedding
-	server
+TARGET_LINK_LIBRARIES (dimensional-embedding
+	${SERVER_LIBRARY}
 	${ATOMSPACE_LIBRARIES}
 	${COGUTIL_LIBRARY}
 )
