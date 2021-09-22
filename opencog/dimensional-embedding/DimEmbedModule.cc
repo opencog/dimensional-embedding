@@ -29,7 +29,6 @@
 #include <string>
 #include <utility>
 
-#include <opencog/atomspaceutils/AtomSpaceUtils.h>
 #include <opencog/atoms/atom_types/NameServer.h>
 #include <opencog/atoms/base/Link.h>
 #include <opencog/atoms/base/Node.h>
@@ -37,6 +36,7 @@
 #include <opencog/guile/SchemePrimitive.h>
 #include <opencog/util/exceptions.h>
 #include <opencog/util/Logger.h>
+#include <opencog/util/mt19937ar.h>
 
 extern "C" {
 #include <opencog/util/cluster.h>
@@ -822,6 +822,28 @@ ClusterSeq DimEmbedModule::kMeansCluster(Type l, int numClusters, int npass, boo
 
     return clusters;
 }
+
+Handle add_prefixed_node(AtomSpace& as, Type t, const std::string& prefix)
+{
+    static const char alphanum[] =
+        "0123456789"
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "abcdefghijklmnopqrstuvwxyz";
+    static const int len = 8;
+    std::string name;
+    Handle result;
+    // Keep trying random suffixes until a non-existant name is generated.
+    do {
+        name = prefix;
+        for (int i = 0; i < len; ++i) {
+            name += alphanum[randGen().randint() % (sizeof(alphanum) - 1)];
+        }
+        result = as.get_handle(t, std::move(std::string(name)));
+    } while (as.is_valid_handle(result));
+
+    return as.add_node(t, std::move(name));
+}
+
 
 void DimEmbedModule::addKMeansClusters(Type l, int maxClusters,
                                        double threshold, int kPasses)
