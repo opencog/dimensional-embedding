@@ -7,7 +7,7 @@ TARGET_LINK_LIBRARIES(DimEmbedUTest
 	# ${SERVER_LIBRARY}
 	# ${ATTENTIONBANK_LIBRARY}
 	server
-	attentionbonk
+	attentionbank
 	attentionval
 	${ATOMSPACE_LIBRARY}
 	${COGUTIL_LIBRARY}
